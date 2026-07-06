@@ -1,1 +1,376 @@
-axd
+<!DOCTYPE html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title></title>
+    </head>
+    <body>
+        <script>
+            /*
+ * crypto-poly.js — pure-JS AES-256-GCM + PBKDF2(SHA-256) DECRYPTION.
+ *
+ * Zero dependency on crypto.subtle, so it works over plain HTTP (non-secure
+ * context) where Web Crypto is unavailable. Interoperable with Node's
+ * `crypto` aes-256-gcm output (96-bit IV -> J0 = IV || 0x00000001,
+ * ciphertext concatenated with the 128-bit auth tag).
+ *
+ * Exposes a single global: PSDecrypt(passphrase, saltB64, ivB64, payloadB64, iters) -> string
+ * Throws on wrong key / tampered payload (GCM tag mismatch).
+ */
+            (function(global) {
+                "use strict";
+
+                // ─────────────── helpers ───────────────
+                function b64ToBytes(b64) {
+                    var bin = atob(b64);
+                    var out = new Uint8Array(bin.length);
+                    for (var i = 0; i < bin.length; i++)
+                        out[i] = bin.charCodeAt(i);
+                    return out;
+                }
+                function writeU32BE(buf, off, val) {
+                    buf[off] = (val >>> 24) & 0xff;
+                    buf[off + 1] = (val >>> 16) & 0xff;
+                    buf[off + 2] = (val >>> 8) & 0xff;
+                    buf[off + 3] = val & 0xff;
+                }
+                function rotr(x, n) {
+                    return (x >>> n) | (x << (32 - n));
+                }
+                function xtime(a) {
+                    return ((a << 1) ^ ((a & 0x80) ? 0x1b : 0)) & 0xff;
+                }
+
+                // ─────────────── SHA-256 ───────────────
+                var K = [0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2];
+                function sha256Init() {
+                    return new Int32Array([0x6a09e667 | 0, 0xbb67ae85 | 0, 0x3c6ef372 | 0, 0xa54ff53a | 0, 0x510e527f | 0, 0x9b05688c | 0, 0x1f83d9ab | 0, 0x5be0cd19 | 0]);
+                }
+                function sha256Block(H, block, off) {
+                    var w = new Int32Array(64), i;
+                    for (i = 0; i < 16; i++) {
+                        w[i] = (block[off + 4 * i] << 24) | (block[off + 4 * i + 1] << 16) | (block[off + 4 * i + 2] << 8) | block[off + 4 * i + 3];
+                    }
+                    for (i = 16; i < 64; i++) {
+                        var s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+                        var s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+                        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+                    }
+                    var a = H[0]
+                      , b = H[1]
+                      , c = H[2]
+                      , d = H[3]
+                      , e = H[4]
+                      , f = H[5]
+                      , g = H[6]
+                      , h = H[7];
+                    for (i = 0; i < 64; i++) {
+                        var S1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+                        var ch = (e & f) ^ (~e & g);
+                        var t1 = (h + S1 + ch + K[i] + w[i]) | 0;
+                        var S0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+                        var maj = (a & b) ^ (a & c) ^ (b & c);
+                        var t2 = (S0 + maj) | 0;
+                        h = g;
+                        g = f;
+                        f = e;
+                        e = (d + t1) | 0;
+                        d = c;
+                        c = b;
+                        b = a;
+                        a = (t1 + t2) | 0;
+                    }
+                    H[0] = (H[0] + a) | 0;
+                    H[1] = (H[1] + b) | 0;
+                    H[2] = (H[2] + c) | 0;
+                    H[3] = (H[3] + d) | 0;
+                    H[4] = (H[4] + e) | 0;
+                    H[5] = (H[5] + f) | 0;
+                    H[6] = (H[6] + g) | 0;
+                    H[7] = (H[7] + h) | 0;
+                }
+                function stateToBytes(H) {
+                    var out = new Uint8Array(32);
+                    for (var i = 0; i < 8; i++)
+                        writeU32BE(out, 4 * i, H[i] >>> 0);
+                    return out;
+                }
+                // Absorb `msg` + padding into state H that has already consumed priorBytes (a multiple of 64).
+                function sha256Continue(H, priorBytes, msg) {
+                    var mlen = msg.length;
+                    var tailLen = Math.ceil((mlen + 1 + 8) / 64) * 64;
+                    var buf = new Uint8Array(tailLen);
+                    buf.set(msg, 0);
+                    buf[mlen] = 0x80;
+                    var bitLen = (priorBytes + mlen) * 8;
+                    writeU32BE(buf, tailLen - 8, Math.floor(bitLen / 0x100000000));
+                    writeU32BE(buf, tailLen - 4, bitLen >>> 0);
+                    for (var off = 0; off < tailLen; off += 64)
+                        sha256Block(H, buf, off);
+                    return stateToBytes(H);
+                }
+                function sha256(bytes) {
+                    var H = sha256Init();
+                    var full = Math.floor(bytes.length / 64) * 64;
+                    for (var off = 0; off < full; off += 64)
+                        sha256Block(H, bytes, off);
+                    return sha256Continue(H, full, bytes.subarray(full));
+                }
+
+                // ─────────────── HMAC-SHA256 (with precomputed pad states) ───────────────
+                function hmacPrepare(key) {
+                    if (key.length > 64)
+                        key = sha256(key);
+                    var ipad = new Uint8Array(64), opad = new Uint8Array(64), i;
+                    for (i = 0; i < 64; i++) {
+                        var k = i < key.length ? key[i] : 0;
+                        ipad[i] = k ^ 0x36;
+                        opad[i] = k ^ 0x5c;
+                    }
+                    var iState = sha256Init();
+                    sha256Block(iState, ipad, 0);
+                    var oState = sha256Init();
+                    sha256Block(oState, opad, 0);
+                    return {
+                        iState: iState,
+                        oState: oState
+                    };
+                }
+                function hmacFinish(states, msg) {
+                    var inner = sha256Continue(states.iState.slice(), 64, msg);
+                    return sha256Continue(states.oState.slice(), 64, inner);
+                }
+
+                // ─────────────── PBKDF2-HMAC-SHA256 ───────────────
+                function pbkdf2(pw, salt, iters, dkLen) {
+                    var states = hmacPrepare(pw);
+                    var blocks = Math.ceil(dkLen / 32);
+                    var out = new Uint8Array(blocks * 32);
+                    for (var b = 1; b <= blocks; b++) {
+                        var msg = new Uint8Array(salt.length + 4);
+                        msg.set(salt, 0);
+                        writeU32BE(msg, salt.length, b);
+                        var u = hmacFinish(states, msg);
+                        var t = u.slice();
+                        for (var i = 1; i < iters; i++) {
+                            u = hmacFinish(states, u);
+                            for (var j = 0; j < 32; j++)
+                                t[j] ^= u[j];
+                        }
+                        out.set(t, (b - 1) * 32);
+                    }
+                    return out.subarray(0, dkLen);
+                }
+
+                // ─────────────── AES-256 (encrypt block; GCM only needs forward cipher) ───────────────
+                var SBOX = (function() {
+                    var sbox = new Uint8Array(256);
+                    var exp = new Uint8Array(256)
+                      , log = new Uint8Array(256);
+                    var x = 1;
+                    for (var i = 0; i < 255; i++) {
+                        exp[i] = x;
+                        log[x] = i;
+                        x ^= xtime(x);
+                    }
+                    for (var a = 0; a < 256; a++) {
+                        var inv = a === 0 ? 0 : exp[(255 - log[a]) % 255];
+                        var s = inv;
+                        sbox[a] = (s ^ ((s << 1) | (s >> 7)) ^ ((s << 2) | (s >> 6)) ^ ((s << 3) | (s >> 5)) ^ ((s << 4) | (s >> 4)) ^ 0x63) & 0xff;
+                    }
+                    return sbox;
+                }
+                )();
+                function subWord(w) {
+                    return ((SBOX[(w >>> 24) & 0xff] << 24) | (SBOX[(w >>> 16) & 0xff] << 16) | (SBOX[(w >>> 8) & 0xff] << 8) | SBOX[w & 0xff]) | 0;
+                }
+                function rotWord(w) {
+                    return ((w << 8) | (w >>> 24)) | 0;
+                }
+                function aesExpandKey(key) {
+                    var Nk = 8, Nr = 14, w = new Int32Array(4 * (Nr + 1)), i, rcon = 1;
+                    for (i = 0; i < Nk; i++) {
+                        w[i] = (key[4 * i] << 24) | (key[4 * i + 1] << 16) | (key[4 * i + 2] << 8) | key[4 * i + 3];
+                    }
+                    for (i = Nk; i < w.length; i++) {
+                        var temp = w[i - 1];
+                        if (i % Nk === 0) {
+                            temp = subWord(rotWord(temp)) ^ (rcon << 24);
+                            rcon = xtime(rcon);
+                        } else if (i % Nk === 4) {
+                            temp = subWord(temp);
+                        }
+                        w[i] = w[i - Nk] ^ temp;
+                    }
+                    return w;
+                }
+                function addRoundKey(s, w, round) {
+                    for (var c = 0; c < 4; c++) {
+                        var wk = w[round * 4 + c];
+                        s[4 * c] ^= (wk >>> 24) & 0xff;
+                        s[4 * c + 1] ^= (wk >>> 16) & 0xff;
+                        s[4 * c + 2] ^= (wk >>> 8) & 0xff;
+                        s[4 * c + 3] ^= wk & 0xff;
+                    }
+                }
+                function aesEncrypt(w, input) {
+                    var s = input.slice(0, 16), r, i, c;
+                    addRoundKey(s, w, 0);
+                    for (r = 1; r < 14; r++) {
+                        for (i = 0; i < 16; i++)
+                            s[i] = SBOX[s[i]];
+                        // SubBytes
+                        shiftRows(s);
+                        mixColumns(s);
+                        addRoundKey(s, w, r);
+                    }
+                    for (i = 0; i < 16; i++)
+                        s[i] = SBOX[s[i]];
+                    shiftRows(s);
+                    addRoundKey(s, w, 14);
+                    return s;
+                }
+                function shiftRows(s) {
+                    var t = s.slice();
+                    for (var r = 1; r < 4; r++)
+                        for (var c = 0; c < 4; c++)
+                            s[4 * c + r] = t[4 * ((c + r) % 4) + r];
+                }
+                function mixColumns(s) {
+                    for (var c = 0; c < 4; c++) {
+                        var i = 4 * c
+                          , a0 = s[i]
+                          , a1 = s[i + 1]
+                          , a2 = s[i + 2]
+                          , a3 = s[i + 3];
+                        s[i] = xtime(a0) ^ (xtime(a1) ^ a1) ^ a2 ^ a3;
+                        s[i + 1] = a0 ^ xtime(a1) ^ (xtime(a2) ^ a2) ^ a3;
+                        s[i + 2] = a0 ^ a1 ^ xtime(a2) ^ (xtime(a3) ^ a3);
+                        s[i + 3] = (xtime(a0) ^ a0) ^ a1 ^ a2 ^ xtime(a3);
+                    }
+                }
+
+                // ─────────────── GCM (GHASH over GF(2^128) + CTR) ───────────────
+                function gmul(X, Y) {
+                    var Z = new Uint8Array(16), V = Y.slice(), i, j;
+                    for (i = 0; i < 128; i++) {
+                        if ((X[i >>> 3] >>> (7 - (i & 7))) & 1)
+                            for (j = 0; j < 16; j++)
+                                Z[j] ^= V[j];
+                        var lsb = V[15] & 1;
+                        for (j = 15; j > 0; j--)
+                            V[j] = (V[j] >>> 1) | ((V[j - 1] & 1) << 7);
+                        V[0] = V[0] >>> 1;
+                        if (lsb)
+                            V[0] ^= 0xe1;
+                    }
+                    return Z;
+                }
+                function ghash(H, data) {
+                    var y = new Uint8Array(16), blocks = Math.ceil(data.length / 16), b, i;
+                    for (b = 0; b < blocks; b++) {
+                        for (i = 0; i < 16; i++) {
+                            var idx = b * 16 + i;
+                            y[i] ^= idx < data.length ? data[idx] : 0;
+                        }
+                        y.set(gmul(y, H));
+                    }
+                    var lenBlock = new Uint8Array(16)
+                      , bitLen = data.length * 8;
+                    writeU32BE(lenBlock, 8, Math.floor(bitLen / 0x100000000));
+                    writeU32BE(lenBlock, 12, bitLen >>> 0);
+                    for (i = 0; i < 16; i++)
+                        y[i] ^= lenBlock[i];
+                    return gmul(y, H);
+                }
+                function inc32(c) {
+                    for (var i = 15; i >= 12; i--) {
+                        c[i] = (c[i] + 1) & 0xff;
+                        if (c[i] !== 0)
+                            break;
+                    }
+                }
+                function gcmDecrypt(w, iv, cipherAndTag) {
+                    var tag = cipherAndTag.subarray(cipherAndTag.length - 16);
+                    var ct = cipherAndTag.subarray(0, cipherAndTag.length - 16);
+                    var H = aesEncrypt(w, new Uint8Array(16));
+                    var J0 = new Uint8Array(16);
+                    J0.set(iv, 0);
+                    J0[15] = 1;
+                    var S = ghash(H, ct);
+                    var eTag = aesEncrypt(w, J0), i;
+                    for (i = 0; i < 16; i++)
+                        eTag[i] ^= S[i];
+                    var diff = 0;
+                    for (i = 0; i < 16; i++)
+                        diff |= eTag[i] ^ tag[i];
+                    // constant-time compare
+                    if (diff !== 0)
+                        throw new Error("authentication failed");
+                    var counter = J0.slice();
+                    inc32(counter);
+                    var out = new Uint8Array(ct.length);
+                    for (var off = 0; off < ct.length; off += 16) {
+                        var ks = aesEncrypt(w, counter);
+                        var n = Math.min(16, ct.length - off);
+                        for (i = 0; i < n; i++)
+                            out[off + i] = ct[off + i] ^ ks[i];
+                        inc32(counter);
+                    }
+                    return out;
+                }
+
+                // ─────────────── public API ───────────────
+                function PSDecrypt(passphrase, saltB64, ivB64, payloadB64, iters) {
+                    var key = pbkdf2(new TextEncoder().encode(passphrase), b64ToBytes(saltB64), iters, 32);
+                    var w = aesExpandKey(key);
+                    var plain = gcmDecrypt(w, b64ToBytes(ivB64), b64ToBytes(payloadB64));
+                    return new TextDecoder().decode(plain);
+                }
+
+                global.PSDecrypt = PSDecrypt;
+            }
+            )(typeof window !== "undefined" ? window : globalThis);
+        </script>
+        <script>
+            (function() {
+                "use strict";
+
+                // ---- Embedded, AES-256-GCM encrypted payload (all base64) ----
+                var ENC = {
+                    payload: "RVWGbAvB1A7vbg5TGBdDgE3nIsxYNIMDXallKusT82F8/PxYYWQnTsfh7D0J/n8FF150dJf00/SP8Lvd3dduTPIEA33dsecEYJHi3qcwT+x3Hl5p9d/kBCXch0kYa02pyMC02w/fPs7N4GCywfiyQdGDLhICzmHahXOJr7HBNmfmGtTeASZJ4l1sRzSa+4Y+2vQToK/ic7v1azCMoAc8BM4Oh3UL5qEw5XoEAWDJrwI8N7W9vhjni9MWsOvq52WgPMKlTU6qJVC4g/pbIoMdNK0QXPSTmKGJhiPq8ACBhsSUnpx7m35Yp+ofLQJslFpr1ZXcPuKPvpWIdmDhldhw0ntcA+h7VTesG+vclpymKBCsev9bWbVpsi5EXS26cKGH7o7pPkMcTeSsc3itweP7YhViKXkwjGM1IX5KOFHU1LLqr63VGKalkfijvzd+Icfmjk2K8JXPDGABe5XEiNzPK5dbyyQhq4qVlsXrNnlKxnX8vZKlVs6//WKiIh2/7HWYGs9wumGvG9V7V+2jzmh4/npg/0o1E3DjU+qp4zgFD8W5hygjTydrZORuW0gym7/p1gFBbDtKYyhrkp3UKcSJHjmZ5oj4VQyuYnjD8JmzmDLBXisZecrud+VOqiWT2ESCWsyDtXjvC86Pegtt/BTIogQQILydt9fICuce2lICQLzuIC/QG0eOIcIWW6HDj7ASMFWRKTNSf/e7pAQ9EN9/jvgWkJGB5Jr5J9yfrfGohGsKsc87n8RYC4f16JWFmzZN4mxSBwui+7/zDlwZtHKLjSDenCm9iyO0DZUV6cy+2rmGIlKgIWodvW4Q19b1EQm+vod2hJ7dWY8p064Oa/v8VZg2IGUoWlmJn5FNM1MTM+0Ym0VSV6Gdkj3UrfCpOn2bNror2kNl93Qsksgea6ztvHXl+HTedJjbP9MDH+RewMALS7YzmD2U5V/QcX712cTwf18t3tJFHfs1QkgZJA/3VNb+mJFf3zQmyJEjJAvIGw2hbDOlyW9hoST39awCT1Lg9cS42K75/lDhOkG4FUdMFAwpLmlP7jSDbYF/vgUz5lm0g+J2gSw4bxrOpnPS8QPXioemn94BBVw7H60nWEKSxtcz1X8WapJNLbRC5re6XhAr/JFG4aQxQXPD6lJFCf7iaUk0LOGPNf1jZrkwefhwI4uFQl0WTI0uz+rvlOG7PhGNBMdaxDjh5F7h2bl8N3DsO/6t2CrP9NNckO4WtGnlMHDomhQJO37VcJkfnVulVy0yyZ/b5FmO5gkdnHg4eDjL4AwfkzmkWoGdRDXMZy/8PGrOzlV348ysQncXyT8f+zlj2h89aTvS0JmeyE9lS87HKB6asUxsAB73E+tG7JDJFiAaSlUDY0/LKGR+YKBwObE9tktCHxN0YB5zL2ZYf6aXiXRlzFC9vqqaTgl50cabMZM1mSD/bhMWrLor7nqUCafJioD9Y4I5ZeF9Wa8RaEt0eB3I3ql1HiZQ66lthEqA2Gj9UyAIkEyl8tRW9oew4wMqMpmuRZPje9tTXC5dJ34Sl/Ok/dkwxrsnAFTJzM+S2XNruKWeZHRQy+OBJuSTceurrRHVyUVrdjt24+WPryZUxNdC1r9xc9n27DHj/PO3nmUT7KcZoxWeUi0k5WuVWZDW7zxNdiIbtjqMdkCDIxsJPdlOmJMPkG1x6ptXmyWty4cuaC/GfGaFA9Je8002WWQHX33TMDfCiOGCJE4yvsERxU40s2oD7+E84Lj738crgdYYvRwzZggP49LHuS2ibF/ltjWy5ESKntTX48s/nqQPGOSZvhbuIAL2Sadz/salGWhpqkg2lpWc9fXfUg0pz3OnUKf5ljmUTTScFCs/wvN/xqXysaO5nlJskCyp/gEZMsZqHevx40jOBfdGpqtk/ExXGzfUM4i2SRO8nRvRUT9H7zXHK/5phfQUJ/D74hhru6/4ZuYrLG7TmCfRO9YDdOLwOz4nLMyftiNeCJ7FjVlv0XMesom4BHd9Jtv2IhomLAxyc3tFr6RacCDxXTb0hTYLJIUay7MWNdX+w2PE4l1xlQZhwGE5n/cCsYEgEiBPFP0Ab/u1wvtCfGH3LklfSM+Hs+KajJt2W4IBXOPXzvTAbHVtmLITALgvp5K5NU5Oxdm/WiGYMr/vmYPTa/7ja25OXg9rSVXId36MTnQ6IzsNz10Jv9Tig70YRZvMpNuSosq5KQxVc9Q1ol6FF3fkj9P6CW0QVOAeAGV//J546kDETAA9yq9FgD/tPmmDcOV8OmVWtziTLKX8y1+kE/2aUbkpTVuNLwmuy0/RbM9PqDRsjCwu1JWUHAhc4V9Puur/9j+7fmikwZTCNi2HtT67MsjOdMiGz2CrnsIoAHuXuw910DoQacP+SVg/4INzcEsz6ttYl58D0P+PDtO/4OQhxkp/ijTwPzJfAqTtpFe6ENGbeIVlz97GnN0M2CpwqJ9BHCX+/qm2ObDMkpoxxrjwTi34Ks4QBAoVm7HtPhUchPpjE/8FZwC9tCLqFy1tVDHm4BrLD62FnO8OicBrMAAH6RAwaZpwkLqorkji20ZipOqeNA/omlP0VAHEQZ7oU4ZhUA9xbMx3WxM02KKI0DOG4ul8iWVLdtgxGL4LJGF5GUL9M4GCZuP2vBUQrb9rWdUJLeFcHo0M+hRec/sL+zP5+5A/k0eq6+ArZdp+RJxYLJ9n8VyxRemrGzEc6mtNDLfO98JAn5WBNk2GnfYmKKqBwUmruvjf25QHhnkj6Ypac8noyr7XXdkT8Z0b5eKSGmKlM7JW+PKPAPGEqFYNjE05Niu38fSWA1mR1YVJtNir2zSb56ETV+Nde8gFUVdAPPTxG6zJH4IaYCiv2L8n7Wb83NKnRKQ5KpaL/qQAClpJNFRMnHfGy48xb963yBb/cKbq5oqxQYoxs8CZ8gHC9hWYaokPbrNJ8T6rjzJWgJL5Ce6js2XEbrEB/Rll5R5nR7bA0fhk3AVhlmJAM1qJiT4NE/o/jDgr7ndKpWVTRSdrSCVI/ppTFTwC1OdRV6+CRGBCQfadZCj09oGW/NKWnwV5lkSH/D0Ah+AuTD2JofZLIhELZLqWJ/lcd9Yag7dzIphxkj1avA7NcsKQK7js/Ey4qh5m0ARikkvX3AVP45yifCAkN7fUuqnWcSgkQFA2XBnKfrL3hwN+jxbCMRb+8gphrZiRCoWVzQiX9O/O2wVFaWUJy8PX//uS6ul1hC/iy+MUBXyX3ug3ukzhWrvjiE387Q1h216kOadRE+azDMB1M1vLO3A1onPesI1mDgse6RP/hETOHvlVajzRqAuYgRnzA8uU+1d8UJwoqbDw2udiw3fySAzQfniPJGYF4ixD85OgxsqZZ1gKolcX2jfjVbERAvHWNW0ttusLgWTvrXkUuej/NvUD2RaDRQAIVH4lNFd4GneDcqkx8axiyeJsP5Ty8257cTg2d4CMg63NEKb+awVBjWwD+28BF05QQ94mwKhEah2cE5ZiRcjySGDelMG/urxRIJdKEtKeTByq6/+mDzbr1eSggurvtAe0Tb0f8h2YEdv0Jn8H04nt7BmR1R2m3XTTAX52BeIvn20p7FZtbkP05sE0gRM2h/UBMXFjrGtlu6yjNzwB5vatS64KOpqHoavKW/k4OUM+27APgdCJ3+v4eWJMU8WvR2SaK7CC6+Nw2QELXNiR3PtnnBkyg8mPbh/OcQUzUNT0mvI5dvosT0kJ4YdUFHS9nj1uUUhX44Y0w8M0PohCRSZEO6xsxGWkyklwCSaLRMDeuvL6zQ4wDS2oEU50SsVhMFp793MEcMjaAN1snTF48DA0By8Jzsroi/HxH3MJF3S4qUI0lH/34BlrjO2fRhw9fTmQTpaMZViRK/KFSJNcmId6k7IfkEPUC1Fvhpfw9E4PsKXZVL/s3Vl/QpaGqPHTP0C4eoPh99nwsQ3+6on1WK+LsOQmxKmLN4ByI9MHezhM+1j2cajJEvcTmEQtd5cT3glLlNZ0fP/pkODE54czpdALpZPcGsgt5QbpG8lrDu5MUc1gNygfUh7vj/ajivZ8lvBxxMdOsXOIDSec0ZKRj+t3aiSsCJfTKv6mu/AMt4iEvki+eL6mf81OXP2KI24I8K52DLAl8CPxVhLlkNCKsu1Me1SwV4bTcLeINM62hfYLJoZUPpFzJgN4Aade7KMcDvX5BeeGOTybGA+MVZnG6WpXRiNs4OBDRsMucQwaeSxxtPxV5qTs8imFLzKkH/kz8pQPF+wvVqLSDY404hBRZ0TMRKBNZNBJl9MBf3zJYO27qPqqpXoMYd7C0+23okvQh3sMDK1jfOqcbAdJATjoLqvlcDGhEpHn4Mzf8QQIVwHPq1qXmSflhF1zkF9yxY+tFhMHrd+RYCyHQzfThVN9HL/SbcuYrx3hrj2zw0UcpzR9r6yttx8e2ToYV2V3VtYbmqKWEChYG+41jk35BQNSjcM3wUbv8e81ovZoICzM5X/QIhJNIQZ0Kev2Z/Jd4Cmx+zrSb+MoynjhQ+1QFLMBs0qtQOjH5oQpUumLogwOw3QVRCO6JhontAexQBE/Lq/wxK/U7ufDFKBycSwNO9BY9mJwd+m75h8UzZCTOkdfwP/dWaIB2Wg79otvcrPjmRA/EQkGRodM4y6xhJA0CIsSSBKzbHLzF1WqsuewkBBhpLdQRyQ81mRK9X7Mj/syZNKCmfTbKWA179sJetBLxLb0YN2mfyuM5Jt6SDaePHLI0NYU1kLSHsl7hSpOxb++idWku9x86Ow9p2EnBsu4C+L4gLhRCLn9CHkClPNIsJy5izFSj4Ub4bQzjmEq7R8ovqDeUKNdqoQ9IFUap5GA2bi2fU8G2VRZcAb7zndHT3s7pRsKFMSxy6157RPkplNWHNAokRON3E0DRivoiJAHFrGmBuNnfMlWy4Nxq6GzSjjkJTdZ0MDS7ZA5tVG/rClB/rlp9L3+LAoRUN1WeLcAYuZmBfMtVSHkl3iAMCl4naSWSMHhD6WmKrWvYQ5LBPddSCph/J/h2iO5wosL2Cck4sZH3eJCxLkGr4MfpOXj3pMR5lEkxaiZrIj7DgX5kyRmmZd7ckG7xdkSX5M9xiZYETvXhYpnAWoxJBArBoV4XBZIgLH1lO6hm2q/U1RtoBrUnDSWfwrxhq4Xfbx0QV46mQ6xy1ImGDYT7vuD8bgbsLTPxqPKomtAe7FRP+l/wlie0j/vUFs9iDA7HvC7tMRCQeKFFxjkbbZtG4QFQ/G47fkFOlVv6SzlSBcUr9puz0y7bmTZ0/6VgcWZVmhqFjzRUPsu8CecZXvLul+2JBcAqZptBoRT+dYzD1+F9kDy+os7FslHXyqFVtilDoYf8RfdLdPMds/1XkKXDmpmkLLVJRD4U4sTlLL+Dpsu92wq5JlSMR7L5rMwWIP17xlIEr/dMps1VWAEF6Upv9pxdGSZXIle2iqY8yQvDlc/0VOfgy9uypE6JE741R34JyttKSGUEL49+meC2/EBs6NwIXnhLmiQPYMo6ir41bKGAh6TWtj7Uw3A1MYq0YzcJ8htx9WRsBtmQ8Ca44Cd6kI9sA3d5pb5ouRW3TTb/ibvLFWphuugskxtCwLjDnF/g90B1F+gPksZeOJomU2L1ev2qaRVL2Mg2D33C4u+jo9JYfZC3cFpRLMWh8UP0tpiJQiH0bvv//HbHBgxiEmUU1k9DO2c/rO+lB0tadRqnRCjXWvLLh99fiiAI6x4yK8mrYEYPBx6yYH24E9xSLGAhcB2kw4Q4LpjcczVgSeQjp94D5YhvHBrOvxw1dVFwBT0gCEBahQAIAViVNpFMcxRjF3iGulvNEjUUBvMmGIGl5GtKZMr5+P2FVXIDR4snw9nUZjQdYWRH2ArygryGfpWvr241mf0ihr02w/PyZKhW1Q6cWROXPibweIWjZ4++JIqh91SfLCuteCBNuWmryuhGgmSx9/dBBRi6wgTOLePfW6IhaJ4PmwXBFrC3NhJZVbVpvHa5ODy4Nuo33YNI4XnX331+Ju+Xalf6PPKyGJF0SgF7sU66fxLAz3FERTyrP/bUeEwuqKR0eO9EnwL8KTlSQpMxr5T+pMS/BwZSPaxH8WGo3S3ERVSmbdUfC2cyhs6LI9NpRRb+Y9Kx7XAyaoHAXOBmgOq0fVpu2ZE57Z9PwoHWYHo1M9DcaAhs1wovZ9Gu7Isa3zi1uaHGeGNfAMHpU+wp+Gy3ihM6dSthoy/8GgpBdXZu6/76pas5ogkcbCBpZh+UZgvxBoCRg2EB31UqP3I31PB8t8OwhPLKlxh0LSuEnedDg4iB+h1HPtQYTGwlcMEf8XYkebQZmjlJyUBX6tbm75Fi0WSbTSrcO9v2OjazT2pLI+kxT/pzRxJ0wKV3I7VkvsC6K6l9PvskT4T1Em75w68RN+i+4gHhCflue7aG2Bhb9HxWsqO0l0AyOKe5J+Xv9jInyzc9TS16vW9DIbXzW4gtJpLK2Sxt0k+lxtbAxnu6G+gTxoI8wk+O6lOh+Mjm0ZfEohmVSmlLGWidA/uS0K5J2Uyg+uQlMWrYzdHCxYNgmaqMWERbE/yM6Ra9C1hIny7/NwuC2F+g6DjgWAHtqyaIXTj/Q5v4dTm9Tke6pDNMVEvZEWbV9L2lzCIHz7CHOx2TcHOm0+moaWCup7b5GSGyVcWMm7WzCUkmZlLQT5tbGjCjMs/h5awiibABvCYevxTAcIZqrHqq0MUJhvkEWHes6k3heUcydmMAdLDK9ExMT8U7xgXUe843TcWUCsR9LDZS8Bx7it/leLHUAzireFQfvWJ2Dd3G1++gHrDVGFqv04oLrAidaZlXtzbTW44iYPrH96IP8Xm+C/A753HeM+8x6q3eAW44SA724117Kb9pGkcydYjcCfUrHlUTIDKl7qAQwaM2OgAMygj1uQWR49ywkoBqzs9y4JlyRaUuZCGSCr/LOlx9nmzksH2NsfhMGx0KPrcfzidXTwBxkAa6hUs7tQBFw0kGTCzOhEbQk+i32l5dJ5xscNI9lSyQtrINuL+l4HxWCYXHJucnPadeEAHBoIuo1BVYYUhjresZNXo2k/ItTjPYZqpWCe0TP6cDYuUEf/AXOzGMkyJqrLfWvIRBRjzPEJheaF1BKyHechw4ejq31VKDptcIGEGaNmRllsGJTc2eRcpMbC2bMopBc1dPQtBHnkFMaXWnC0s/m3Jc+lOje2hqwyedwr6WuBekIMJvIlut4CMRItV7YcwSu7R9pvcDpL6DMqG8jHWX2xV0pB+kgGjSs2VCC0FghiwW3Wy3piUg4FDCYeh+PkT3ORSx00Ch3WX9/yVvi7HQ/WG4miw5CjYSRyYYzZE7X05ow+S4GiTKlS53V2e5MHrQBcLZUk/z8UdO6pdkeFWQIAwv5dz6+1vZLIcis1XKcsFYc7Y5cXlJOOARWdkGrgProf/YWtUjmdzXCQvv9Lz1ytawNEeI2zyZMA7enfycT4+aUT7TW4EJYfKPqZ55bnxm1HzLW4qBKCG8T/9JmsR1NPhLgVME24cpmLgpnMYZmyJID+jDfxxNQis1QJzEjtOxK1QmCfGx9zAzbFNeb+R/RuRP1GDZ7iD3GsGCVRJGtgUNVkIof1jzkrytWpQ3zIxA1mI71wPzgEiEmD2utAbcRAhB72ZZFKtLn1zxHTIyJhW9b3VRpanASvzZIasiXeM4+hAW16vm8fpPtbiJuiHYOMOtmwwXjCsLPwhjY2astvK+k67WdN+VOy9hyoZgT+OltqKBo3w7Cl8eIOV4L/ZgDKjCMsyJ7llZyD4WNe+CVlCCUalZxMhnOEikJpPHv8pamgtIM9zGM8fEzf5QsYzEIibXxSYBvS8hTIMg31TzHZLY1nk6rTXS8EsiyiEGgAnpgspPPgifLWICpXZ3pwdyIj+t4mxG1LTDaGh2Kp441ctfhbdOw1Bq6as5ur+iSznj3TCtLgV9R3MPHaRNIawONQYTHAqM5bcDeNMeCrJ+ZdkanPFL1Fffcw0fu719VZLkEaMSigSGnS3TKTak4hUAbDieDp+dNhWksscSkgBsUH+pvxb8NjaKsBQ4UNshD2URFpqEC0RYDPrY4GNLtSYtY9ymYxssAaEHr2LSsTUjnhF7m/2DSO1g6NEdix76Xd29mhhgCzwon97A6wDUduUDWEPPUzjS6qrJIshKKCi08ml8OPO1APRusNfr5H3jWC1089JlzNtHzuM3TZHaoeahb9QA1M6j4TemLI5QOeQ+L9MJIpRM7XolbMCX/LQ4LPU6QaujWXjIYGxfcWZ45sM8E2PuNhYzhwRd6/cQ7WuBGLdQSk34aUnxT43YjUpVrLsWBVSHXAXCmGLkEblgdtK44Y1eZcSWp3qFreZ/5cRUVbd0n/NKhq34/akAcMGPvkcsKl+EHP7kyyL9iM9G50nQg2cjD48GZ4cewfR9/CGEj8a6Vez/gyQFRJjL8FjsalY6cKpeK1MXr83f7K/tdD8XViyTIdIIZt5OeZ9tpgTHPsaomAhCiqUbAQmjqaoZpVQcns+cXJgJqOoHcCcVGNcbC8QQaEQcvU19AalEg2mbTjVXyBYXJrlsa4P1NdbmpbIXeRIcLlZptp2XrI8Nus5ebtG285pYf3bdEETvwyNTi/MuS9J8FWV8M0/0c5gn7mU86D9zmuqS4DLcdaRF33vHC+ccZBa/a0GkkK16VesFB/9zb919cquaVXg315sNNl4tXFTgS7VDDv833Pafj5xMKaJgAqv5fdLE8KgoKwt6a6DttEdNiN2EowRNXtbtsUklsuwSBcNXXtra2hQqEyOykLKUPfvbxxmaSzAK9YO8gDfnhkA/Xy0Rrxk3roZSCBSgF/fq9M8v9BGuLusr32HloP/AwmRCA5GdEdKv3icu2mqPWeg+VOJlUUi4StbWwcSPLKfpe95BVqBmQ9I77Ky2QP6VcmwrUG/sqGb2pMn8gN1WXPzua9Z+nfb5eBExcHsu/DKWqLsbwpOqadnAbzb9NNaNAwUOSxDgUZnenz5rHxZeAWALX9BnsJWnHOrq/O7eqkJ/IqXTyovkIDBRh8itVAjmRjptTMJTBsKPKl4Xf3WGjP1Yzt6lPh8ZaqhYxn38gJfmAoP5usCOjPzXkC3hgPp/SHetkNwLxwFsvrwhQQAnOiMeoSy2OVGXBhIEHdbv8ABuKMjNDl3j4xEnQRl3n5PBW4cyiaaDWuiRAd/7cAb2EeHiYR9lhxvH76q6VCp/oydMQJxCwalOv1wP3CEBWaXUrujAEazy3ggXV+OqVqq2VgbKCKCKa3ybN1rTKJ1RjTYsv6OJii+cKgEMHnwmaCZxFmRODRaCXOM6J2/SCVAWQSDt+t/SjAnXoIlbOIlIbZd8zoLwKjFFV3+QqsmnGOT0+kJ89+jtT4mkd+5Q/YTPDQXNUdtywRwDDn0agTm4DS6IO7AcYjkAUenf82W/FVx5b03nngZx/SZp6MPadm8wSGTlQ6vFmvMRzUl5TzT/oApx4qs2tKO9jZAEzaG4TYJ+c8YMlfcaUKfEyMejpz3E/7pMfVFXVFRag+M66wrxpFYqNNfX0oEbbxMKy53j/3gUMWCHZMi+qByB1x/8qLocyDrR53tKvKZAEkyIyx2dwanEXR28/Tlwve/t7tY5OBFimqK8k9VZh7qCtD5mv+SFbcdBC1KayMhwYDgm5YDIpL6hv1uKYt4+P9TgGe1dwDikKHnOwCQB98wwGyJ6aKaNvb4vV2sf/eI2YoTlDsihnjaSSxy0hi9GdiejKIfdgHIwn3KP2RYNGBPKY5MVU2xOK6yFi7QRuX52oODofb63qkOAY8RjcE6ihY5QW9vLEkDM76DZcauwy60o5BKHuRbVsDjjAh9USRfynVrRjnVoFrQW1uoeTwO84xiLuNFUqjT1yhWKZwOPlN4S5gdEat9rjXz5DV3u4djpry2EDtVMiFpPaeadSe3iFf10jZ1y+HS8DgdPtXhOsMBhQAQf+jv30WV0+IBCliY849DyH0w4VOmEBt9KQ+eizM2LLgssv5Dy0wx/cwZiOBJVOcjOAPDYj9jK++v7VF8tr1ub3fGDYIOvuPAnGoGkY28isesbnpd0dJZYru5O3bTA9cfzSxvgnniXPW/wZhP4JU3I8KkIdp6ufHLdoMeOu3LOetXVdjlPDQ/hkRQfe2/DPVN9JZ2AWiwvwdtKexnxnLSjleYjnXfQyRqgRu5EKXNs/w42SGROaeKi1aTxNK2HNEPOZUK3jU4f+bLJecgh0/dIpT/1p1zesJP1l9iqwIGRb/r9BJydbbanOhBTsJBgYNbKEMC99ItunlG+wmTmBVnfbRSCEiYdbDczIKBJ8QRE5FBmQBo+LZI88dCzK0rhvvzoxcuoSBGEgGQa1uN/wj8glKYG4TxY1M5fUfZikAvZMCGgLoh6gFxzDBQhhg8kpeCSjtiwbjU4KiM5j+3OeBNK7HBR7rcU6ipy8zeyw7OufJomddPWlhn7nv2qixD43ttJY2cJ7U7H8CSswrDP4DyD/ZhcFjOvl/TnFOpCANL87teAgCMvKdr+/GuP04U0/Bw3X2jGlDyvMj9UWQgesNnlpPyCwuJQZ8w8Doh048w23dUUfok8qxXWPT3HKwTYZ9qjGBC3SkI5WzM6WvIk5AJxj3H470AmIDOF6+R2BB9z/o0wUQKGb1qUvIdVSLFvXJjl8b7GinwPGDQdGzkBRLoX769+NO3AEb1Rx/aMYB67TAZw4tAYR98Ew5wa9znnz13EiIPChbv2Uo1pmCsBMbzcvRdqkMmdqHwPrjCvgHlRpq2AptF5LpU6Ns3k6gGZSAbs3JZp3YEfGXvMl+KLilqKbrvAiTbmurKGyLAnaCbjeyXhsaQw6pr8YTdPl08ji5MkiIVcCABL5G1RYIK1hngC3SWg89oIDqyYVz19f+A8I/k8lMvqnwlL1tRV74LkMGJj9JPWM2h14rZOMj2cOltIKg7L2E1Udci3P3WOC/fxdphVKWVJ7ZOT44ItfidB6EcYziDUlSQGXTiQHNnhrvYGGGBTXTj2/LZT3s97FByLphXAD/hD+2/udFaxN+Xnte0NATcL1Qbnnyn9/0Gm7hV9s/0PVTzHv6oz3em4bX4LFW1cF9wChJUMN9mL0Wz550182lcfodZFgdlpFM7lg1f4FtW0my3OF7TxbutwyF4WXAWg7LQi7U21F6iB0kkUfJ/cymLqS3texCFun9cwxsrAzJAk7V/xo+WUToqijdDavrw8+t9JKtq30/MGDGS86oJFs22+wT9Vuw1B8f4/wozH9nAPk1Oa6hi1i7VwNG4e/AXS7nKmGoP5ScsgMoCRAvh+zwpy2P7ysvwmh5almLBebVmYrqQbD1eOL8kcTGkw6IeM4q8UdhDy50IsLXKx92p0OD5ZJXRA9Vi/F0ESd8WlebDIGuBu8MNSIYs8pHE7WxhV4Okqf+jAsqG6wMnxdlC3/cYY9AOmFr98dIxz6Xux1xhntYwCVhB+rY6Dx/HCv1gpalYQw6CX/rcedYZVpGlR/jHP6huh/b0ix9CZctvoW0LhZ8qWWMesrzHiTheMZl3DUHNLd+b23Uq9wSSCW/v5YIteb5QVPjSs7BFuk2ALgxP8wiOsb4cMQisT958KRXdr1qjzEIPBN9cBp2Gga53MvFbEY56+3Jo/nEX4wrPy/lEDavDNkraxaIdQZ8JMpyVPDOTzr4U83MVL8LfC9BKLmluZHQGDS0MOyV9skaQwQGI0YsJQnGnTV0eedG6IeqIyFLM1cURYBAmSqSmjIx/J4qwoKVkVLAvk8UGIoY9tz3PYbnRRLxJw3ThHgIVkaWM4zrlohaL2rq79yaZFxCo7OD9auwt7Pojki1GwRmnNeWBhmmEpaY2iFVNi+0Dn2+lw7mUt+LtMtghztoY2lKbLa/UNJT66LewIy3OKXuUzOWIcAkc+roGWUV679nEh4UrEWdKM8aREvcpVkiXk/5TnShDYyR5T7MdsFhrcpX1VHMJ5vCGhFvUqZQg7C2dRaNEGZMvmFKsXG2p8VeVPfnRZv+YL3l4XCBOLRdIBh3BXL2wLWS20EWz/8zgNuN9hDtAycdQZ43rD9VfvaZwHjI41szHS9E/UUxAImYzaIYVNbegt6neeDZEyoEWuUYUlUoCQenyKRIahn5cBIWSYjYpnOQrbVOpRdf7k0aVi1i/8RGOVchnxz7xCfwtT68w0cKybGn0MMV804epBz2YCbG3bjBDyvhDO9j41bgVa2Y+KynoPMkjIFQPoLMbGLIVptkdoZu9ecvzveXdoWcv/2V1Owc4060ytKabldt9Zlcr3mXSHA8MWgnscQyRWcnP+Xy1ubsn4QUSGDam2eTlkDxUqEk/DLZQWLDcsCISkldxQ8n16OYepXai3PBmbkcaTBzv7MsL/c0/FdDtuZNY0haeEdNaWPphU8Bkh1gqYokkohR2uR4nIG8d3ZTpzvKIZrOz/uFvKppdABG8xOWBtW7zfa5wyo5uYvYdaq392P/N9imE2tdL21u+ZUTOotsrqB/7UfCfX6xXjl6r7VDB6aTIyGSGpI7Vsg/4V8pHP6DstdrCv3Kc3YiryXZOtMBEetcdnv5ZNuayuh/cQmuN1s4np4dL7RzbYUhnkGEyABe4bETxCZFCPo03PUS2+DayYbM0/kld2Hdnpe7js7ULRCVKdOmI/yFj5Pt6uc1WLxN2xXsizBOdnzO9FKy77iRpvP0Zq3GWstdo/vKzrW4gohJNYYQRILW8xrfSFcKqRNMSTmc3zII4ls4jCKn7VUe2gPGRjF/q5m6kMBFxqvMuzm9zJYPX5DdNhOBY1x/gMz+ZLKNx9gnCIS3Ys7nVnBo9UonlM/1f1HndaKAEPq7LZDjM7h8t20+iCisxVd4xLCiTZYh6kCvsOqTAF3aUZNfUKiZy6V9BenV4b223q8lJkQnCsr9T85E8miRK2JTI8TSnhGWJTtQQcSjYIlfhELrr0s8u0mBwj7rfy9RGI0UU6vys0Y1KFCsbiPRdnKuldf/C6YaQ+I6hpLdGY2jPJS1w1MCT+73aEirfJtSVGQSU7t7SDDV3Ymumu6qiOScZs95fyF6MFHe+kSQWnAiKB6CJAakVG0XyMnlj3utsBeztSM0OAMek2xfx2Z+RX6l1v0QIEDXm+hqzyV0/XU6O8thKMxIido9bjBox1o0ze9MuG2rqaRsUum8PZG2mw7gbrSQ9qDInd0+e5UTrkwc0jeYL65f1+uXXV//jjL3xytU7GvBheTjli/mg+B/Ab5dsjbIkH33tUSLjCUBhQHwz5OyEEXUCSIGwZBvBbZ3BnrDBP22Uv8PH7hl7G6+BwJvh6ukNUX+UZUA6zgjonW7VOng6ptBQ5iTcqf/Mku2eadNe0jVa8MFnBT3oYwVo11MvysOKRBKtyLXyXZ869ENP3jdYXy7ojEbCDpp7YQkcEEFAWXHuis+XGiOd32zR+b62yPIjiXG7IX+dSn8c6s8YhJfU85MZW/tC+Tp08nh5ojAFRJKo+ZoSz2NXLE39kup908suF3CWuj5Ra7tRAOu0+HwKRfPIVdDnGIKdeNjcMlB49/eqafJ65WrcHTU5EP3iEpr4ZIoYenG8MA27SsH9H2HobFQZ7Z6vMgN3xy1oZa/IYTpINd+s1kEfsEQ2OgcVMDfHu5xZjKa/aWfwoFET8u+atEhXQJzrMfUBYf9agA1VyAQpaNODwt7qFurYJi/jb+CccyrsKJik/rY0Lz/pPciFvv7VCcL8vD43cl0stdATXQkQY2UGRnmrt+QIEiUbz/yLpS8h+zLJNzm0BQ2+rxoXubFLHn2hbn+mKTUL70GrDW6hk+SxZkWE3En+3VCmYU1unnDpPQLlqx+oM2qTtckKmhvXvpojlN56mM1n3tnE+8zWjtD1Z2q5aoG24MVcw2zsWA9h0fzyhT3XDGUu0FZD72lKpadRP0hPAknLttl0IF06nQpZOMVVY4TuCaEtFVkwKmxNqiYBbauIxr2P/++SYI8h6rh9Qfm8O4bMgzR9CuWARXqDvPm5rPvq5hNpfOxCMvCzlGd7ypmKf6FnCvvO4PxwQMc/MFoar5QIidWZSjf1e/p47UTvWdCmCjyw5nmSTdSoIYFszf/gZeJiF3B2ZhVW37YSBb60beS4JfZVDjhIQmvW6A9Tb7MaMQlizc1KakrHYFQnOVVPRleUM005KKI+UryUdnA2DGu0aKdh0Sse8NL+jiOMijSo8k61VIoqOoTugiFrXRzrD+on6e9qzuvJgFirPDXIJ2XkYmXVZoCvl5UbXgHuQdCIT6X8DHDRYYcX/JEv6+SY5v2PNQTE2d9CAVnev0TeB0+JTTNfyZU2inuopuwi5pd6mhDTPG9QPuGrQakNg640CgCpUw9a9KDmT4rIQ1EhT+PmOHgDCyvFd4BKppKU2erjlKA6UKUis6BdxwSi8fxUWXB4pq5Hxwsth0eFPvqYvaOyb1x6RGi7LSElED59ckns/CtvFcImjlzAl2nMjO8LOzjeWM6GatB73knVFN+67n/IDmb0ea/PUvJ7/Tsf5w6M8qfXO9llBeIgOCisQHucJa2kVovsR4evNdfQtROXvxeRmhxBIJXpvY5u/7BlCNUdNxhQpNg5KBYFjv1Z+BU6Ov4IZPOwB0Dz78khxNMhboVRulSNxvHPdTlotVEL6ZUZIh5g6elCPYfrXLsvNdyphNNdqSl/WoCbuqHEB1snQh2hhXi1FocbvjSnpRFQ5LI3dkK0XsZ4IjiNjihtGRk66SpkKp5BaiGfZvvmGOQFmQ369Zz5I8DR/dGK0NgqY64lGSJ0EXFTAZ/LTPdbZot1dDFv4yovYNT9o5acG76lmaBHe/eKeU1pdY8leXLhqdNTT0k15yF0PfdQS8aPWVfhxZ/5TkTB5Cbv2FqANiz8rTNLJ+mcLnZyFQANA0lwldHXsRffikNb4nSlExf8GZMk3SSAL5cNHiWQ8CSM9D0DlEwQRhDakqcAPEfiJ9BvNXuhLcg7dhPd91DfaNkGBUUTd/mzali0/5xqJCqtiTpLbZ2RsnoO6aEmsa5Z4RL38pthTvLXk3F4i8+I83bglydaEjuHZfutkg1Xv/iqFAoYPTY2GnHCWv5yBIqbM+jCu/G4X75hCYN7tc90pj/DfPGJ17vohakqgegwcxAVYEXfZn7vhMW7aWy2E06YtK+4Ci59GiLL4gGxxRjaexk7jiYdYGHryJYznY1Sw9qEhNo5tuWFNgTQBLX9eEJxu6buttJzJoa5qy6/RZj6bDuG+nYYOapEL1L6TVgtNMGbb/jWauggo9YrYXnZuWeE6Io9nzvyHM9EiaK3CPrpGWnEiZR9gvRL9zDPwNoPxGje4loYI1PHrD4vFzS7Zi71unIVEwOFjIpe4s/YG5uU1u/AROubE5KVeTZrIhnL4obxz8rAGwejcWFSHxJbaXW29M6GtVAG1XTdH9g0DM33Q9j7nAXIJotfSdZehibobwvu0XDJ1sEBxLBkefkIyITVhu/XDb28yDkP3p9zDDmkXRfjx0C5MdOrihDC1SRaQiFlMEQ+XcoM9It61zKh5lFkHap7cU+fWrh2RlO+sDlGimSoqpA7Avh2kwxpd36d4lZorcZB8u5iDTB85bNv9tFnrxBh9OZtahxlnQIcrawSzsNvxs9txZbC/hu7HhKvgylXFcEcGLENpkPz53dW+0xk7Gyj8zO4jgVF18ETYaG6tojesWi9Viq1Ohc0J+vbvR00OkAwnapIVRpR2wE/GoBGYnXvPe1FWmQx1awue2EaK96trAiE1xz6cKCX5W7tVaof0iDGBOb7JTfxD7ONlQM0AznAQw5AZTYn+y5RVEgXgKOtFkFtYXYSI1qbV138fkItCSmFDovAHyB8/P0JwcjnMvp9DLjauuzq1P9+ldBUjVzSkKLxsu6LSv3NYN7LqhJf++Cjf3S0OegbPQWHGP6d+XIU/hULzxvjSSBY8pbSarGJ1s1xj5r8xNMYxOfF/f/Yo9CQQAoXdie9twFWi5cGjmyVJYYRR8Yrn0psO71q7iqxZn8o4rSRHAY=",
+                    // ciphertext || 128-bit GCM auth tag
+                    salt: "yvPK04+uRDbGCw8WTb2pGw==",
+                    // PBKDF2 salt
+                    iv: "nsB4Y+OQCJ0QlXwE",
+                    // AES-GCM nonce
+                    iters: 250000 // PBKDF2 iterations
+                };
+
+                function fail() {
+                    // Wrong/absent key or tampered payload: fail hard, render nothing.
+                    document.open();
+                    document.write("");
+                    document.close();
+                }
+
+                try {
+                    var key = new URLSearchParams(location.search).get("key");
+                    if (!key)
+                        return fail();
+
+                    // PSDecrypt (pure JS) verifies the GCM auth tag; a wrong key throws.
+                    var html = PSDecrypt(key, ENC.salt, ENC.iv, ENC.payload, ENC.iters);
+
+                    document.open();
+                    document.write(html);
+                    document.close();
+                } catch (e) {
+                    fail();
+                }
+            }
+            )();
+        </script>
+    </body>
+</html>
